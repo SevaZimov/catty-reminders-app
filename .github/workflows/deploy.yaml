@@ -6,56 +6,31 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 env:
   SSH_HOST: course.prafdin.space
   SSH_PORT: "3144"
   SSH_USER: seva
+  IMAGE_NAME: ghcr.io/sevazimov/catty-reminders-app
+  CONTAINER_NAME: catty-reminders-app
 
 jobs:
   deploy:
-    name: Build and deploy release
+    name: Deploy Docker image
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out release
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.release.tag_name }}
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
+      - name: Prepare deployment variables
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: Run unit tests
-        run: python -m pytest -q tests/test_unit.py
-
-      - name: Build release archive
-        run: |
-          DEPLOY_SHA="$(git rev-parse HEAD)"
-
-          if [[ "$DEPLOY_SHA" != "$GITHUB_SHA" ]]; then
-            echo "Checked out SHA does not match release SHA" >&2
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid deployment SHA: $GITHUB_SHA" >&2
             exit 1
           fi
 
-          echo "DEPLOY_SHA=$DEPLOY_SHA" >> "$GITHUB_ENV"
-
-          tar \
-            --exclude=.git \
-            --exclude=.github \
-            --exclude=.deploy \
-            --exclude=venv \
-            --exclude=app.log \
-            -czf "$RUNNER_TEMP/catty-release.tar.gz" .
+          echo "DEPLOY_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "IMAGE_REF=$IMAGE_NAME:$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "REMOTE_DOCKER_CONFIG=/tmp/catty-docker-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
 
       - name: Prepare SSH connection
         env:
@@ -78,80 +53,84 @@ jobs:
 
           chmod 600 "$HOME/.ssh/known_hosts"
 
-      - name: Copy release to virtual machine
+      - name: Log in to GHCR on virtual machine
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          REMOTE_ARCHIVE="/tmp/catty-release-${GITHUB_RUN_ID}.tar.gz"
-          echo "REMOTE_ARCHIVE=$REMOTE_ARCHIVE" >> "$GITHUB_ENV"
+          test -n "$GHCR_TOKEN"
 
-          scp \
-            -P "$SSH_PORT" \
-            -i "$HOME/.ssh/github_actions" \
-            "$RUNNER_TEMP/catty-release.tar.gz" \
-            "$SSH_USER@$SSH_HOST:$REMOTE_ARCHIVE"
+          printf '%s' "$GHCR_TOKEN" |
+            ssh \
+              -p "$SSH_PORT" \
+              -i "$HOME/.ssh/github_actions" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=10 \
+              "$SSH_USER@$SSH_HOST" \
+              "install -d -m 700 '$REMOTE_DOCKER_CONFIG' && DOCKER_CONFIG='$REMOTE_DOCKER_CONFIG' docker login ghcr.io --username '$GITHUB_ACTOR' --password-stdin"
 
-      - name: Deploy release
+      - name: Deploy container
         run: |
           ssh \
             -p "$SSH_PORT" \
             -i "$HOME/.ssh/github_actions" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
             "$SSH_USER@$SSH_HOST" \
-            "bash -s -- '$DEPLOY_SHA' '$REMOTE_ARCHIVE'" <<'REMOTE_SCRIPT'
+            "bash -s -- '$DEPLOY_SHA' '$IMAGE_REF' '$CONTAINER_NAME' '$REMOTE_DOCKER_CONFIG'" <<'REMOTE_SCRIPT'
           set -Eeuo pipefail
 
           DEPLOY_SHA="$1"
-          ARCHIVE_PATH="$2"
+          IMAGE_REF="$2"
+          CONTAINER_NAME="$3"
+          DOCKER_CONFIG_DIR="$4"
 
-          APP_ROOT="/home/seva/Documents/catty-reminders-app"
-          PYTHON="$APP_ROOT/venv/bin/python"
-          RELEASE_DIR="$APP_ROOT/.deploy/releases/$DEPLOY_SHA"
-          APP_LOG="$APP_ROOT/app.log"
+          EXPECTED_IMAGE="ghcr.io/sevazimov/catty-reminders-app:$DEPLOY_SHA"
 
           if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Invalid deploy SHA: $DEPLOY_SHA" >&2
+              echo "Invalid deployment SHA: $DEPLOY_SHA" >&2
               exit 1
           fi
 
-          case "$ARCHIVE_PATH" in
-              /tmp/catty-release-*.tar.gz) ;;
+          if [[ "$IMAGE_REF" != "$EXPECTED_IMAGE" ]]; then
+              echo "Unexpected image reference: $IMAGE_REF" >&2
+              exit 1
+          fi
+
+          case "$DOCKER_CONFIG_DIR" in
+              /tmp/catty-docker-*) ;;
               *)
-                  echo "Invalid archive path: $ARCHIVE_PATH" >&2
+                  echo "Invalid Docker configuration path" >&2
                   exit 1
                   ;;
           esac
 
-          if [[ ! -x "$PYTHON" ]]; then
-              echo "Python virtual environment not found: $PYTHON" >&2
-              exit 1
-          fi
+          export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
 
-          mkdir -p "$RELEASE_DIR"
-          tar -xzf "$ARCHIVE_PATH" -C "$RELEASE_DIR"
-          rm -f -- "$ARCHIVE_PATH"
+          docker pull "$IMAGE_REF"
 
-          cd "$RELEASE_DIR"
-          "$PYTHON" -m pytest -q tests/test_unit.py
+          docker rm --force "$CONTAINER_NAME" 2>/dev/null || true
 
           pkill -f '[u]vicorn app\.main:app' 2>/dev/null || true
           pkill -f '[p]ython(3)? .*app\.py' 2>/dev/null || true
 
-          for _ in {1..10}; do
-              if ! pgrep -f '[u]vicorn app\.main:app' >/dev/null; then
-                  break
-              fi
-              sleep 1
-          done
-
-          DEPLOY_REF="$DEPLOY_SHA" nohup "$PYTHON" -m uvicorn app.main:app \
-              --host 0.0.0.0 \
-              --port 8181 \
-              > "$APP_LOG" 2>&1 < /dev/null &
-
-          NEW_PID=$!
+          docker run --detach \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              --publish 8181:8181 \
+              --env "DEPLOY_REF=$DEPLOY_SHA" \
+              "$IMAGE_REF"
 
           for _ in {1..30}; do
-              if ! kill -0 "$NEW_PID" 2>/dev/null; then
-                  echo "Application exited unexpectedly" >&2
-                  tail -n 50 "$APP_LOG" >&2 || true
+              if ! docker inspect \
+                  --format '{{.State.Running}}' \
+                  "$CONTAINER_NAME" 2>/dev/null \
+                  | grep -qx true; then
+                  echo "Container exited unexpectedly" >&2
+                  docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
                   exit 1
               fi
 
@@ -161,7 +140,7 @@ jobs:
               )"
 
               if [[ "$PAGE" == *"content=\"$DEPLOY_SHA\""* ]]; then
-                  echo "Deploy completed: $DEPLOY_SHA"
+                  echo "Deploy completed: $IMAGE_REF"
                   exit 0
               fi
 
@@ -169,9 +148,23 @@ jobs:
           done
 
           echo "Application did not become ready" >&2
-          tail -n 50 "$APP_LOG" >&2 || true
+          docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
           exit 1
           REMOTE_SCRIPT
+
+      - name: Remove temporary registry credentials
+        if: always()
+        run: |
+          ssh \
+            -p "$SSH_PORT" \
+            -i "$HOME/.ssh/github_actions" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            "$SSH_USER@$SSH_HOST" \
+            "case '$REMOTE_DOCKER_CONFIG' in /tmp/catty-docker-*) rm -rf -- '$REMOTE_DOCKER_CONFIG' ;; esac" \
+            || true
 
       - name: Remove SSH private key
         if: always()
