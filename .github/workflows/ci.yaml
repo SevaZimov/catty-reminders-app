@@ -28,14 +28,12 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Run tests and create report
-        run: |
-          set -o pipefail
-          python -m pytest -q tests/test_unit.py | tee test_result.txt
+        run: python -m pytest -q tests/test_unit.py --junitxml=test_result.xml
 
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: test_result
-          path: test_result.txt
+          path: test_result.xml
           if-no-files-found: error
