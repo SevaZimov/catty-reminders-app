@@ -6,21 +6,23 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 env:
   SSH_HOST: course.prafdin.space
   SSH_PORT: "3144"
   SSH_USER: seva
   IMAGE_NAME: ghcr.io/sevazimov/catty-reminders-app
-  CONTAINER_NAME: catty-reminders-app
+  REMOTE_DEPLOY_DIR: /home/seva/.local/share/catty-reminders-app
 
 jobs:
   deploy:
-    name: Deploy Docker image
+    name: Deploy with Docker Compose
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check out released commit
+        uses: actions/checkout@v7
+
       - name: Prepare deployment variables
         run: |
           if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -30,7 +32,7 @@ jobs:
 
           echo "DEPLOY_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
           echo "IMAGE_REF=$IMAGE_NAME:$GITHUB_SHA" >> "$GITHUB_ENV"
-          echo "REMOTE_DOCKER_CONFIG=/tmp/catty-docker-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          echo "REMOTE_COMPOSE_FILE=$REMOTE_DEPLOY_DIR/docker-compose.yaml" >> "$GITHUB_ENV"
 
       - name: Prepare SSH connection
         env:
@@ -53,24 +55,7 @@ jobs:
 
           chmod 600 "$HOME/.ssh/known_hosts"
 
-      - name: Log in to GHCR on virtual machine
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          test -n "$GHCR_TOKEN"
-
-          printf '%s' "$GHCR_TOKEN" |
-            ssh \
-              -p "$SSH_PORT" \
-              -i "$HOME/.ssh/github_actions" \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=yes \
-              -o ConnectTimeout=10 \
-              "$SSH_USER@$SSH_HOST" \
-              "install -d -m 700 '$REMOTE_DOCKER_CONFIG' && DOCKER_CONFIG='$REMOTE_DOCKER_CONFIG' docker login ghcr.io --username '$GITHUB_ACTOR' --password-stdin"
-
-      - name: Deploy container
+      - name: Copy Docker Compose configuration
         run: |
           ssh \
             -p "$SSH_PORT" \
@@ -80,13 +65,35 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=10 \
             "$SSH_USER@$SSH_HOST" \
-            "bash -s -- '$DEPLOY_SHA' '$IMAGE_REF' '$CONTAINER_NAME' '$REMOTE_DOCKER_CONFIG'" <<'REMOTE_SCRIPT'
+            "install -d -m 700 '$REMOTE_DEPLOY_DIR'"
+
+          ssh \
+            -p "$SSH_PORT" \
+            -i "$HOME/.ssh/github_actions" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            "$SSH_USER@$SSH_HOST" \
+            "cat > '$REMOTE_COMPOSE_FILE' && chmod 600 '$REMOTE_COMPOSE_FILE'" \
+            < docker-compose.yaml
+
+      - name: Deploy application
+        run: |
+          ssh \
+            -p "$SSH_PORT" \
+            -i "$HOME/.ssh/github_actions" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            "$SSH_USER@$SSH_HOST" \
+            "bash -s -- '$DEPLOY_SHA' '$IMAGE_REF' '$REMOTE_COMPOSE_FILE'" <<'REMOTE_SCRIPT'
           set -Eeuo pipefail
 
           DEPLOY_SHA="$1"
           IMAGE_REF="$2"
-          CONTAINER_NAME="$3"
-          DOCKER_CONFIG_DIR="$4"
+          COMPOSE_FILE="$3"
 
           EXPECTED_IMAGE="ghcr.io/sevazimov/catty-reminders-app:$DEPLOY_SHA"
 
@@ -100,40 +107,26 @@ jobs:
               exit 1
           fi
 
-          case "$DOCKER_CONFIG_DIR" in
-              /tmp/catty-docker-*) ;;
-              *)
-                  echo "Invalid Docker configuration path" >&2
-                  exit 1
-                  ;;
-          esac
+          if [[ "$COMPOSE_FILE" != "/home/seva/.local/share/catty-reminders-app/docker-compose.yaml" ]]; then
+              echo "Unexpected Compose file path: $COMPOSE_FILE" >&2
+              exit 1
+          fi
 
-          export DOCKER_CONFIG="$DOCKER_CONFIG_DIR"
+          export IMAGE_REF
+          export DEPLOY_REF="$DEPLOY_SHA"
 
-          docker pull "$IMAGE_REF"
+          docker compose --file "$COMPOSE_FILE" pull
 
-          docker rm --force "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm --force catty-reminders-app 2>/dev/null || true
 
-          pkill -f '[u]vicorn app\.main:app' 2>/dev/null || true
-          pkill -f '[p]ython(3)? .*app\.py' 2>/dev/null || true
+          docker compose --file "$COMPOSE_FILE" up \
+              --detach \
+              --no-build \
+              --remove-orphans \
+              --wait \
+              --wait-timeout 120
 
-          docker run --detach \
-              --name "$CONTAINER_NAME" \
-              --restart unless-stopped \
-              --publish 8181:8181 \
-              --env "DEPLOY_REF=$DEPLOY_SHA" \
-              "$IMAGE_REF"
-
-          for _ in {1..30}; do
-              if ! docker inspect \
-                  --format '{{.State.Running}}' \
-                  "$CONTAINER_NAME" 2>/dev/null \
-                  | grep -qx true; then
-                  echo "Container exited unexpectedly" >&2
-                  docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
-                  exit 1
-              fi
-
+          for _ in {1..15}; do
               PAGE="$(
                   curl --silent --fail --location \
                     http://127.0.0.1:8181/login || true
@@ -141,30 +134,17 @@ jobs:
 
               if [[ "$PAGE" == *"content=\"$DEPLOY_SHA\""* ]]; then
                   echo "Deploy completed: $IMAGE_REF"
+                  docker compose --file "$COMPOSE_FILE" ps
                   exit 0
               fi
 
               sleep 1
           done
 
-          echo "Application did not become ready" >&2
-          docker logs --tail 50 "$CONTAINER_NAME" >&2 || true
+          echo "Application returned an unexpected deployref" >&2
+          docker compose --file "$COMPOSE_FILE" logs --tail 100 >&2 || true
           exit 1
           REMOTE_SCRIPT
-
-      - name: Remove temporary registry credentials
-        if: always()
-        run: |
-          ssh \
-            -p "$SSH_PORT" \
-            -i "$HOME/.ssh/github_actions" \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o ConnectTimeout=10 \
-            "$SSH_USER@$SSH_HOST" \
-            "case '$REMOTE_DOCKER_CONFIG' in /tmp/catty-docker-*) rm -rf -- '$REMOTE_DOCKER_CONFIG' ;; esac" \
-            || true
 
       - name: Remove SSH private key
         if: always()
