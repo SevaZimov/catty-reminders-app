@@ -113,7 +113,6 @@ jobs:
           fi
 
           export IMAGE_REF
-          export DEPLOY_REF="$DEPLOY_SHA"
 
           docker compose --file "$COMPOSE_FILE" pull
 

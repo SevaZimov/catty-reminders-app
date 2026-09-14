@@ -19,12 +19,12 @@ services:
     image: ${IMAGE_REF:-catty-reminders-app:lab4}
     build:
       context: .
+      args:
+        DEPLOY_REF: ${BUILD_DEPLOY_REF:-local}
     restart: unless-stopped
     depends_on:
       database:
         condition: service_healthy
-    environment:
-      DEPLOY_REF: ${DEPLOY_REF:-local}
     ports:
       - "8181:8181"
     healthcheck:
