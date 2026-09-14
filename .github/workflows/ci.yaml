@@ -32,8 +32,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run tests and create report
-        run: python -m pytest -q tests/test_unit.py --junitxml=test_result.xml
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run all tests and create report
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8181 > /tmp/catty-app.log 2>&1 &
+          APP_PID=$!
+          trap 'kill "$APP_PID" 2>/dev/null || true' EXIT
+
+          curl --retry 10 --retry-connrefused --retry-delay 1 \
+            --fail --silent http://127.0.0.1:8181/login > /dev/null
+
+          python -m pytest -q --junitxml=test_result.xml
 
       - name: Upload test report
         if: always()
@@ -61,3 +72,5 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          build-args: |
+            DEPLOY_REF=${{ github.sha }}
